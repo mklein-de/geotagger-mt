@@ -1,0 +1,443 @@
+#!/opt/local/bin/python
+
+import bisect
+import csv
+import fnmatch
+import json
+import logging
+import math
+import os
+import pyexiv2
+import pytz
+import re
+import time
+import urllib, urllib2
+from Queue import Queue
+from argparse import ArgumentParser
+from datetime import datetime, timedelta
+from glob import glob
+from lxml import etree
+from threading import Thread
+
+class GeonamesApi:
+    def __init__(self, username):
+        self.username = username
+        self.baseurl = 'http://api.geonames.org'
+        self.locations = {}
+        self.countries = {}
+
+    def request(self, path, args):
+        args['username'] = self.username
+        url = "%s/%s?%s" % (self.baseurl, path, urllib.urlencode(args))
+        httpResult = urllib2.urlopen(url).read()
+        logging.debug("%s: %s" % (url, httpResult))
+        return json.loads(httpResult)
+
+    def timezone(self, pt):
+        res = self.request('timezoneJSON', { 'lat': pt.lat, 'lng': pt.lon })
+        return pytz.timezone(res['timezoneId'])
+
+    def location(self, pt):
+        key = (pt.lat, pt.lon)
+        if not key in self.locations:
+            res = self.request('findNearbyPostalCodesJSON',
+                               { 'lat': pt.lat, 'lng': pt.lon, 'maxRows': 1 })['postalCodes'][0]
+            self.locations[key] = res
+            ccode = res['countryCode']
+            if not ccode in self.countries:
+                self.countries[ccode] = self.request('countryInfoJSON',
+                                                     { 'country': ccode })['geonames'][0]['countryName']
+
+            self.locations[key]['countryName'] = self.countries[ccode]
+
+        return self.locations[key]
+
+class Trackpoint:
+    Radius = 6371000
+
+    def __init__(self, ts, lat, lon, ele):
+        self.ts = ts
+        self.lat = lat
+        self.lon = lon
+        self.ele = ele
+
+    def latr(self):
+        return math.radians(self.lat)
+
+    def lonr(self):
+        return math.radians(self.lon)
+
+    def distance(self, other):
+        sin_d_lon = math.sin((other.lonr() - self.lonr()) / 2)
+        sin_d_lat = math.sin((other.latr() - self.latr()) / 2)
+        a = sin_d_lat*sin_d_lat + math.cos(self.latr()) * math.cos(other.latr())*sin_d_lon*sin_d_lon;
+        return self.Radius*2*math.atan2(math.sqrt(a), math.sqrt(1-a))
+
+def readGPXFile(fn):
+    ret = []
+    logging.debug("processing GPX file '%s'" % fn)
+    doc = etree.parse(open(fn))
+    ns = { 'gpxns': doc.getroot().nsmap[None] }
+    for trkpt in doc.findall('//gpxns:trk/gpxns:trkseg/gpxns:trkpt', ns):
+        [lat, lon] = map(float, [trkpt.attrib['lat'], trkpt.attrib['lon']])
+        ele, time = None, None
+        for child in trkpt:
+            tag = re.sub('\{.*\}', '', child.tag)
+            if tag == 'ele':
+                ele = float(child.text)
+            elif tag == 'time':
+                time = datetime.strptime(child.text, '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=pytz.UTC)
+
+        ret.append(Trackpoint(time, lat, lon, ele))
+
+    logging.debug("%s: %d trackpoints" % (fn, len(ret)))
+    return ret
+
+class Coordinate:
+    def __init__(self, flt, ref):
+        r, d = math.modf(math.fabs(flt))
+        s, m = math.modf(r*60)
+        self.dms = (d, m, s*60, ref[0 if flt >= 0 else -1])
+
+    def exifList(self):
+        return [pyexiv2.Rational(self.dms[0], 1),
+                pyexiv2.Rational(self.dms[1], 1),
+                pyexiv2.Rational(self.dms[2]*10000, 10000)]
+
+    def exifRef(self):
+        return self.dms[3]
+
+    def __str__(self):
+        return u"%d\xb0%d'%f%s" % self.dms
+
+class WorkerThread(Thread):
+    class QueueItem:
+        def __init__(self, image):
+            self.metadata = pyexiv2.ImageMetadata(image)
+            self.metadata.read()
+            self.fn = image
+            self.modified = False
+            self.protocol = { 'File': image, 'Date': str(self.timestamp()) }
+            self.pos = None
+
+        def __contains__(self, tag):
+            return tag in self.metadata
+
+        def __getitem__(self, tag):
+            return self.metadata[tag]
+
+        def __setitem__(self, tag, value):
+            self.metadata[tag] = value
+            self.modified = True
+
+        def write(self):
+            self.metadata.write()
+            self.modified = False
+
+        def augment(self, d):
+            if 'Latitude' in d and 'Longitude' in d:
+                logging.debug("%s: augmenting" % self.fn)
+                if 'Elevation' in d:
+                    p = Trackpoint(None, float(d['Latitude']), float(d['Longitude']), float(d['Elevation']))
+                else:
+                    p = Trackpoint(None, float(d['Latitude']), float(d['Longitude']), None)
+
+                self.setPos(p)
+
+            for iptc_tag in ['City', 'ProvinceState', 'CountryName']:
+                if iptc_tag in d:
+                    self.setIptcTag(iptc_tag, d[iptc_tag])
+
+        def timestamp(self):
+            return self['Exif.Photo.DateTimeOriginal'].value
+
+        def setPos(self, pos):
+            self.pos = pos
+            lat_dms = Coordinate(pos.lat, 'NS')
+            lon_dms = Coordinate(pos.lon, 'EW')
+            logging.debug("%s: %f/%f -> %s/%s" % (self.fn, pos.lat, pos.lon, lat_dms, lon_dms))
+
+            self['Exif.GPSInfo.GPSMapDatum'] = 'WGS-84'
+            self.protocol['Latitude'] = pos.lat
+            self.protocol['Longitude'] = pos.lon
+            self['Exif.GPSInfo.GPSLatitude'] = lat_dms.exifList()
+            self['Exif.GPSInfo.GPSLatitudeRef'] = lat_dms.exifRef()
+            self['Exif.GPSInfo.GPSLongitude'] = lon_dms.exifList()
+            self['Exif.GPSInfo.GPSLongitudeRef'] = lon_dms.exifRef()
+
+            if pos.ele is not None:
+                self.protocol['Elevation'] = pos.ele
+                self['Exif.GPSInfo.GPSAltitude'] = pyexiv2.Rational(pos.ele, 1)
+                self['Exif.GPSInfo.GPSAltitudeRef'] = '0';
+
+        def setIptcTag(self, tag, value):
+            self.protocol[tag] = value
+            self['Iptc.Application2.' + tag] = [value]
+            self.iptc_charset = 'utf-8'
+
+        def resolveLocation(self, args, api):
+            if self.pos is not None:
+                loc = api.location(self.pos)
+                self.setIptcTag('City', loc[args.city_tag])
+                self.setIptcTag('ProvinceState', loc[args.province_tag])
+                self.setIptcTag('CountryName', loc['countryName'])
+
+    def __init__(self, rd, wr, args):
+        Thread.__init__(self)
+        self.rd, self.wr, self.args = rd, wr, args
+
+    def run(self):
+        while True:
+            item = self.rd.get()
+            if item is None:
+                logging.debug("%s: exiting" % self.__class__.__name__)
+                if self.wr is not None:
+                    self.wr.put(None)
+
+                return
+            else:
+                try:
+                    item = self.process(item)
+                    if self.wr is not None:
+                        self.wr.put(item)
+                except:
+                    logging.exception("Exception in %s:" % self.__class__.__name__)
+
+                self.rd.task_done()
+
+class ImageWriter(WorkerThread):
+    protocol_keys = ['File', 'Date', 'Latitude', 'Longitude', 'Elevation', 'City', 'ProvinceState', 'CountryName']
+
+    def __init__(self, rd, wr, args):
+        WorkerThread.__init__(self, rd, wr, args)
+        if self.args.protocol_file is not None:
+            self.protocol_file = open(self.args.protocol_file, 'w')
+            self.protocol_file.write(';'.join(self.protocol_keys) + '\n')
+
+    def process(self, item):
+        if item.modified:
+            if self.args.dry_run:
+                logging.info("%s: writing %s (SIMULATION RUN)" % (self.__class__.__name__, item.fn))
+            else:
+                logging.info("%s: writing %s" % (self.__class__.__name__, item.fn))
+                item.write()
+        else:
+            logging.debug("%s: not writing %s (not modified)" % (self.__class__.__name__, item.fn))
+
+        if self.args.set_image_file_time and not self.args.dry_run:
+            os.utime(item.fn, (time.time(), time.mktime(item.timestamp().timetuple())))
+
+        if self.args.protocol_file is not None:
+            a = []
+            for k in self.protocol_keys:
+                if k in item.protocol:
+                    a.append(str(item.protocol[k]))
+                else:
+                    a.append("")
+
+            self.protocol_file.write(';'.join(a) + '\n')
+
+        return None
+
+class Augmenter(WorkerThread):
+    def __init__(self, rd, wr, args):
+        logging.info("augmenting from %s" % args.augment_file)
+        self.augment_data = {}
+        for row in csv.DictReader(open(args.augment_file), delimiter=';'):
+            self.augment_data[row['File']] = dict([kv for kv in row.items() if kv[1]])
+        WorkerThread.__init__(self, rd, wr, args)
+
+    def process(self, item):
+        if item.fn in self.augment_data:
+            item.augment(self.augment_data[item.fn])
+
+        return item
+
+class TrackCorrelator(WorkerThread):
+    def __init__(self, rd, wr, args, tp):
+        self.tp = tp
+        self.timestamps = [p.ts for p in tp]
+        WorkerThread.__init__(self, rd, wr, args)
+
+    def process(self, item):
+        if 'Exif.GPSInfo.GPSLatitude' in item or 'Exif.GPSInfo.GPSLongitude' in item:
+            if not self.args.force:
+                logging.info("%s has GPS coordinates, skipping track correlation" % item.fn)
+                return item
+
+        logging.debug("%s: processing %s" % (self.__class__.__name__, item.fn))
+        local = item.timestamp() + timedelta(0, self.args.offset)
+        local = self.args.timezone.localize(local)
+        utc = local.astimezone(pytz.UTC)
+        logging.debug("%s: local time: %s, UTC: %s" % (item.fn, local, utc))
+        if utc < self.timestamps[0]:
+            delta = self.timestamps[0] - utc
+            pos = self.tp[0]
+            distance = 0
+        elif utc > self.timestamps[-1]:
+            delta = utc - self.timestamps[-1]
+            pos = self.tp[-1]
+            distance = 0
+        else:
+            i = bisect.bisect_left(self.timestamps, utc)
+            distance = self.tp[i].distance(self.tp[i-1])
+            if self.args.use == 'nearest':
+                if self.timestamps[i]-utc > utc-self.timestamps[i-1]:
+                    pos = self.tp[i-1]
+                else:
+                    pos = self.tp[i]
+            elif self.args.use == 'next':
+                delta = self.timestamps[i] - utc
+                pos = self.tp[i]
+            elif self.args.use == 'prev':
+                pos = self.tp[i-1]
+                delta = utc - self.timestamps[i-1]
+            else:
+                delta = self.timestamps[i] - self.timestamps[i-1]
+                w = float((utc-self.timestamps[i-1]).seconds)/(self.timestamps[i]-self.timestamps[i-1]).seconds
+                if self.tp[i].ele is None or self.tp[i-1].ele is None:
+                    pos = Trackpoint(utc,
+                                     w*self.tp[i].lat+(1.0-w)*self.tp[i-1].lat,
+                                     w*self.tp[i].lon+(1.0-w)*self.tp[i-1].lon,
+                                     None)
+                else:
+                    pos = Trackpoint(utc,
+                                     w*self.tp[i].lat+(1.0-w)*self.tp[i-1].lat,
+                                     w*self.tp[i].lon+(1.0-w)*self.tp[i-1].lon,
+                                     w*self.tp[i].ele+(1.0-w)*self.tp[i-1].ele)
+
+        logging.debug("distance=%fm, delta=%s" % (distance, delta))
+        valid = ((not self.args.satisfy == 'all' and (distance <= self.args.max_distance or
+                                                      delta.seconds <= self.args.max_delta)) or
+                 (distance <= self.args.max_distance and delta.seconds <= self.args.max_delta))
+
+        if not valid:
+            logging.debug("%s: no coordinate found" % item.fn)
+            return item
+
+        if not 'Exif.GPSInfo.GPSVersionID' in item:
+            item['Exif.GPSInfo.GPSVersionID'] = '2 0 0 0'
+
+        item.setPos(pos)
+        return item;
+
+
+class GeoCoder(WorkerThread):
+    def __init__(self, rd, wr, args, api):
+        self.api = api
+        WorkerThread.__init__(self, rd, wr, args)
+
+    def process(self, item):
+        logging.debug("%s: processing %s" % (self.__class__.__name__, item.fn))
+        item.resolveLocation(self.args, self.api)
+        return item
+
+
+op = ArgumentParser()
+op.add_argument("-q", "--quiet", action="store_const", dest="loglevel", const=logging.WARNING, default=logging.INFO,
+                help="No messages except warnings")
+op.add_argument("-v", "--verbose", action="store_const", dest="loglevel", const=logging.DEBUG,
+                help="Print debug messages")
+op.add_argument("-t", "--timezone", dest="timezone", default=None, type=pytz.timezone,
+                help="Camera time zone")
+op.add_argument("-o", "--offset", dest="offset", metavar="SECONDS", default=0, type=int,
+                help="Camera clock offset")
+op.add_argument("-s", "--set-image-file_time", dest="set_image_file_time", action="store_true",
+                help="Set image file time to shooting time")
+op.add_argument("-r", "--reverse-geo-coding", dest="reverse_geo_coding", action="store_true",
+                help="Perform reverse geo coding")
+op.add_argument("-f", "--force", dest="force", action="store_true",
+                help="Overwrite image metadata")
+op.add_argument("-n", "--dry-run", dest="dry_run", action="store_true",
+                help="Simulation run, don't write files")
+op.add_argument("-g", "--gpx-file", dest="gpx_files", action="append", metavar="FILE", default=[],
+                help="GPX track. May be given multiple times")
+op.add_argument("-G", "--gpx-dir", dest="gpx_dirs", action="append", metavar="DIR", default=[],
+                help="Directory containing GPX track(s). May be given multiple times")
+op.add_argument("-i", "--image-file", dest="image_files", action="append", metavar="FILE", default=[],
+                help="Image file. May be given multiple times")
+op.add_argument("-I", "--image-dir", dest="image_dirs", action="append", metavar="DIR", default=[],
+                help="Directory containing image file(s). May be given multiple times")
+op.add_argument("-p", dest="protocol_file", metavar="FILE", default=None,
+                help="CSV formatted protocol output")
+op.add_argument("-a", "--augment", dest="augment_file", metavar="FILE", default=None,
+                help="CSV formatted protocol input")
+op.add_argument("-u", "--geonames-username", dest="geonames_username", metavar="USER", default="demo",
+                help="Username for geonames.org requests")
+op.add_argument("--max-delta", dest="max_delta", metavar="SECONDS", default="300", type=int,
+                help="Maximum time difference between to track points")
+op.add_argument("--max-distance", dest="max_distance", metavar="METER", default="100", type=int,
+                help="Maximum spacial distance between to track points")
+op.add_argument("--satisfy", dest="satisfy", choices=('any', 'all'), default='any',
+                help="Condition for --max-delta and --max-distance")
+op.add_argument("--use", dest="use", choices=('average', 'nearest', 'prev', 'next'), default='average',
+                help="Use time-weighted average or nearest/previous/next point")
+op.add_argument("--queue-size", dest="queue_size", metavar="QUEUESIZE", default=5, type=int,
+                help="Worker thread queue size")
+op.add_argument("--city-tag", dest="city_tag", choices=('placeName', 'adminName1', 'adminName2', 'adminName3'),
+                default='placeName',
+                help="geonames.org tag name used for city name")
+op.add_argument("--province-tag", dest="province_tag", choices=('placeName', 'adminName1', 'adminName2', 'adminName3'),
+                default='adminName1',
+                help="geonames.org tag name used for province/state name")
+
+args = op.parse_args()
+
+geoapi = GeonamesApi(args.geonames_username)
+
+logging.basicConfig(format='%(message)s', level=args.loglevel)
+
+def collect_files(where, pattern):
+    ret = []
+    for d in where:
+        for root, dirs, files in os.walk(d):
+            ret.extend(map(lambda f: os.path.join(root, f), fnmatch.filter(files, pattern)))
+
+    return ret
+
+all_gpx_files = set(args.gpx_files + collect_files(args.gpx_dirs, '*.[Gg][Pp][Xx]'))
+
+tasks = []
+tasks.insert(0, ImageWriter(Queue(maxsize=args.queue_size), None, args))
+
+if args.reverse_geo_coding:
+    tasks.insert(0, GeoCoder(Queue(maxsize=args.queue_size), tasks[0].rd, args, geoapi))
+
+if len(all_gpx_files) > 0:
+    all_trackpoints = sum(map(readGPXFile, all_gpx_files), [])
+    trackpoints = sorted(list(set(all_trackpoints)), key=lambda point: point.ts)
+    if len(trackpoints) == 0:
+        logging.warning("no trackpoints found")
+    else:
+        if args.timezone is None:
+            args.timezone = geoapi.timezone(trackpoints[0])
+            logging.info("assuming camera timezone %s" % args.timezone)
+
+    tasks.insert(0, TrackCorrelator(Queue(maxsize=args.queue_size), tasks[0].rd, args, trackpoints))
+else:
+    logging.info("no GPS tracks given, skipping track correlation")
+
+if args.augment_file is not None:
+    tasks.insert(0, Augmenter(Queue(maxsize=args.queue_size), tasks[0].rd, args))
+
+all_image_files = set(args.image_files + collect_files(args.image_dirs, '*.[Jj][Pp][Gg]'))
+
+[t.start() for t in tasks]
+
+try:
+    for image in sorted(all_image_files):
+        logging.info("%s: reading %s" % ("Main thread", image))
+        qi = WorkerThread.QueueItem(image)
+        tasks[0].rd.put(qi)
+
+except KeyboardInterrupt:
+    logging.warning("keyboard interrupt.")
+
+finally:
+    tasks[0].rd.put(None)
+
+logging.debug("waiting for worker threads...")
+[t.join() for t in tasks]
+
+logging.debug("done")
+
