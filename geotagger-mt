@@ -171,7 +171,10 @@ class WorkerThread(Thread):
                 self['Exif.GPSInfo.GPSAltitudeRef'] = '0';
 
         def setIptcTag(self, tag, value):
-            self.protocol[tag] = value
+            if type(value) == type(u''):
+                self.protocol[tag] = value.encode('utf-8')
+            else:
+                self.protocol[tag] = value
             self['Iptc.Application2.' + tag] = [value]
             self.iptc_charset = 'utf-8'
 
@@ -206,13 +209,13 @@ class WorkerThread(Thread):
                 self.rd.task_done()
 
 class ImageWriter(WorkerThread):
-    protocol_keys = ['File', 'Date', 'Latitude', 'Longitude', 'Elevation', 'City', 'ProvinceState', 'CountryName']
+    protocol_fields = ['File', 'Date', 'Latitude', 'Longitude', 'Elevation', 'City', 'ProvinceState', 'CountryName']
 
     def __init__(self, rd, wr, args):
         WorkerThread.__init__(self, rd, wr, args)
         if self.args.protocol_file is not None:
-            self.protocol_file = open(self.args.protocol_file, 'w')
-            self.protocol_file.write(';'.join(self.protocol_keys) + '\n')
+            self.protocol_writer = csv.DictWriter(open(self.args.protocol_file, 'w'), self.protocol_fields)
+            self.protocol_writer.writeheader()
 
     def process(self, item):
         if item.modified:
@@ -228,14 +231,7 @@ class ImageWriter(WorkerThread):
             os.utime(item.fn, (time.time(), time.mktime(item.timestamp().timetuple())))
 
         if self.args.protocol_file is not None:
-            a = []
-            for k in self.protocol_keys:
-                if k in item.protocol:
-                    a.append(str(item.protocol[k]))
-                else:
-                    a.append("")
-
-            self.protocol_file.write(';'.join(a) + '\n')
+            self.protocol_writer.writerow(item.protocol)
 
         return None
 
@@ -243,7 +239,7 @@ class Augmenter(WorkerThread):
     def __init__(self, rd, wr, args):
         logging.info("augmenting from %s" % args.augment_file)
         self.augment_data = {}
-        for row in csv.DictReader(open(args.augment_file), delimiter=';'):
+        for row in csv.DictReader(open(args.augment_file)):
             self.augment_data[row['File']] = dict([kv for kv in row.items() if kv[1]])
         WorkerThread.__init__(self, rd, wr, args)
 
@@ -284,11 +280,13 @@ class TrackCorrelator(WorkerThread):
             if self.args.use == 'nearest':
                 if self.timestamps[i]-utc > utc-self.timestamps[i-1]:
                     pos = self.tp[i-1]
+                    delta = utc - self.timestamps[i-1]
                 else:
                     pos = self.tp[i]
+                    delta = self.timestamps[i] - utc
             elif self.args.use == 'next':
-                delta = self.timestamps[i] - utc
                 pos = self.tp[i]
+                delta = self.timestamps[i] - utc
             elif self.args.use == 'prev':
                 pos = self.tp[i-1]
                 delta = utc - self.timestamps[i-1]
@@ -307,8 +305,8 @@ class TrackCorrelator(WorkerThread):
                                      w*self.tp[i].ele+(1.0-w)*self.tp[i-1].ele)
 
         logging.debug("distance=%fm, delta=%s" % (distance, delta))
-        valid = ((not self.args.satisfy == 'all' and (distance <= self.args.max_distance or
-                                                      delta.seconds <= self.args.max_delta)) or
+        valid = ((self.args.satisfy != 'all' and (distance <= self.args.max_distance or
+                                                  delta.seconds <= self.args.max_delta)) or
                  (distance <= self.args.max_distance and delta.seconds <= self.args.max_delta))
 
         if not valid:
