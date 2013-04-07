@@ -167,8 +167,8 @@ class WorkerThread(Thread):
 
             if pos.ele is not None:
                 self.protocol['Elevation'] = pos.ele
-                self['Exif.GPSInfo.GPSAltitude'] = pyexiv2.Rational(pos.ele, 1)
-                self['Exif.GPSInfo.GPSAltitudeRef'] = '0';
+                self['Exif.GPSInfo.GPSAltitude'] = pyexiv2.Rational(abs(pos.ele), 1)
+                self['Exif.GPSInfo.GPSAltitudeRef'] = '0' if pos.ele >= 0 else '1';
 
         def setIptcTag(self, tag, value):
             if type(value) == type(u''):
