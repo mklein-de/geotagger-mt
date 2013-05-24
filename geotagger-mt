@@ -37,11 +37,11 @@ class GeonamesApi:
         res = self.request('timezoneJSON', { 'lat': pt.lat, 'lng': pt.lon })
         return pytz.timezone(res['timezoneId'])
 
-    def location(self, pt):
-        key = (pt.lat, pt.lon)
+    def location(self, lat, lon):
+        key = (lat, lon)
         if not key in self.locations:
             res = self.request('findNearbyPostalCodesJSON',
-                               { 'lat': pt.lat, 'lng': pt.lon, 'maxRows': 1 })['postalCodes'][0]
+                               { 'lat': lat, 'lng': lon, 'maxRows': 1 })['postalCodes'][0]
             self.locations[key] = res
             ccode = res['countryCode']
             if not ccode in self.countries:
@@ -109,6 +109,9 @@ class Coordinate:
 
     def __str__(self):
         return u"%d\xb0%d'%f%s" % self.dms
+
+def make_float(x):
+    return x.to_float() if type(x)==type(pyexiv2.Rational(1,1)) else float(x)
 
 class WorkerThread(Thread):
     class QueueItem:
@@ -179,8 +182,14 @@ class WorkerThread(Thread):
             self.iptc_charset = 'utf-8'
 
         def resolveLocation(self, args, api):
-            if self.pos is not None:
-                loc = api.location(self.pos)
+            if 'Exif.GPSInfo.GPSLatitude' in self and 'Exif.GPSInfo.GPSLongitude' in self:
+                dms = map(lambda x: make_float(x), self['Exif.GPSInfo.GPSLatitude'].value)
+                ref = self['Exif.GPSInfo.GPSLatitudeRef'].value
+                lat = float(dms[0]+dms[1]/60+dms[2]/3600) * {'N':1,'S':-1}[ref]
+                dms = map(lambda x: make_float(x), self['Exif.GPSInfo.GPSLongitude'].value)
+                ref = self['Exif.GPSInfo.GPSLongitudeRef'].value
+                lon = float(dms[0]+dms[1]/60+dms[2]/3600) * {'E':1,'W':-1}[ref]
+                loc = api.location(lat, lon)
                 self.setIptcTag('City', loc[args.city_tag])
                 self.setIptcTag('ProvinceState', loc[args.province_tag])
                 self.setIptcTag('CountryName', loc['countryName'])
