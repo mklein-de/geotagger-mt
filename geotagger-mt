@@ -13,7 +13,7 @@ import re
 import time
 import urllib, urllib2
 from Queue import Queue
-from argparse import ArgumentParser
+from argparse import ArgumentParser, ArgumentTypeError
 from datetime import datetime, timedelta
 from glob import glob
 from lxml import etree
@@ -339,6 +339,18 @@ class GeoCoder(WorkerThread):
         item.resolveLocation(self.args, self.api)
         return item
 
+def timeDelta(s):
+    value, unit = re.match("([0-9]+)([a-z]*)", s).groups()
+    value = int(value)
+    if unit in ('d', 'days'):
+        return value*60*60*24
+    elif unit in ('h', 'hours'):
+        return value*60*60
+    elif unit in ('m', 'min', 'minutes'):
+        return value*60
+    elif unit in ('', 's', 'sec', 'seconds'):
+        return value
+    raise ArgumentTypeError('invalid time unit: %s' % unit)
 
 op = ArgumentParser()
 op.add_argument("-q", "--quiet", action="store_const", dest="loglevel", const=logging.WARNING, default=logging.INFO,
@@ -371,7 +383,7 @@ op.add_argument("-a", "--augment", dest="augment_file", metavar="FILE", default=
                 help="CSV formatted protocol input")
 op.add_argument("-u", "--geonames-username", dest="geonames_username", metavar="USER", default="demo",
                 help="Username for geonames.org requests")
-op.add_argument("--max-delta", dest="max_delta", metavar="SECONDS", default="300", type=int,
+op.add_argument("--max-delta", dest="max_delta", metavar="SECONDS", default="300sec", type=timeDelta,
                 help="Maximum time difference between to track points")
 op.add_argument("--max-distance", dest="max_distance", metavar="METER", default="100", type=int,
                 help="Maximum spacial distance between to track points")
