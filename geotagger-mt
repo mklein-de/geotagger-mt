@@ -14,6 +14,7 @@ import time
 import urllib, urllib2
 from Queue import Queue
 from argparse import ArgumentParser, ArgumentTypeError
+from collections import defaultdict
 from datetime import datetime, timedelta
 from glob import glob
 from lxml import etree
@@ -190,9 +191,10 @@ class WorkerThread(Thread):
                 ref = self['Exif.GPSInfo.GPSLongitudeRef'].value
                 lon = float(dms[0]+dms[1]/60+dms[2]/3600) * {'E':1,'W':-1}[ref]
                 loc = api.location(lat, lon)
-                self.setIptcTag('City', loc[args.city_tag])
-                self.setIptcTag('ProvinceState', loc[args.province_tag])
-                self.setIptcTag('CountryName', loc['countryName'])
+                country = loc['countryName']
+                self.setIptcTag('City', args.tagmapper.city(country, loc))
+                self.setIptcTag('ProvinceState', args.tagmapper.province(country, loc))
+                self.setIptcTag('CountryName', country)
 
     def __init__(self, rd, wr, args):
         Thread.__init__(self)
@@ -394,13 +396,29 @@ op.add_argument("--use", dest="use", choices=('average', 'nearest', 'prev', 'nex
 op.add_argument("--queue-size", dest="queue_size", metavar="QUEUESIZE", default=5, type=int,
                 help="Worker thread queue size")
 op.add_argument("--city-tag", dest="city_tag", choices=('placeName', 'adminName1', 'adminName2', 'adminName3'),
-                default='placeName',
+                default=None,
                 help="geonames.org tag name used for city name")
 op.add_argument("--province-tag", dest="province_tag", choices=('placeName', 'adminName1', 'adminName2', 'adminName3'),
-                default='adminName1',
+                default=None,
                 help="geonames.org tag name used for province/state name")
 
 args = op.parse_args()
+
+class TagMapper(defaultdict):
+    def __init__(self):
+        defaultdict.__init__(self, lambda: (args.city_tag or 'placeName', args.province_tag or 'adminName1'))
+
+    def addCountry(self, country, city_tag, province_tag):
+        self[country] = (args.city_tag or city_tag, args.province_tag or province_tag)
+
+    def city(self, country, loc):
+        return loc[self[country][0]]
+
+    def province(self, country, loc):
+        return loc[self[country][1]]
+
+args.tagmapper = TagMapper()
+args.tagmapper.addCountry('Austria', 'adminName3', 'adminName1')
 
 geoapi = GeonamesApi(args.geonames_username)
 
