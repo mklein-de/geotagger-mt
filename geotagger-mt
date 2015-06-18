@@ -193,7 +193,9 @@ class WorkerThread(Thread):
                 loc = api.location(lat, lon)
                 country = loc['countryName']
                 self.setIptcTag('City', args.tagmapper.city(country, loc))
-                self.setIptcTag('ProvinceState', args.tagmapper.province(country, loc))
+                p = args.tagmapper.province(country, loc)
+                if p is not None:
+                    self.setIptcTag('ProvinceState', p)
                 self.setIptcTag('CountryName', country)
 
     def __init__(self, rd, wr, args):
@@ -415,7 +417,10 @@ class TagMapper(defaultdict):
         return loc[self[country][0]]
 
     def province(self, country, loc):
-        return loc[self[country][1]]
+        try:
+            return loc[self[country][1]]
+        except KeyError:
+            return None
 
 args.tagmapper = TagMapper()
 args.tagmapper.addCountry('Austria', 'adminName3', 'adminName1')
