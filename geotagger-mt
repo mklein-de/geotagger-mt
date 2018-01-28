@@ -180,7 +180,10 @@ class WorkerThread(Thread):
             else:
                 self.protocol[tag] = value
             self['Iptc.Application2.' + tag] = [value]
-            self.iptc_charset = 'utf-8'
+            try:
+                value.encode('ascii')
+            except UnicodeEncodeError:
+                self.metadata.iptc_charset = 'utf-8'
 
         def resolveLocation(self, args, api):
             if 'Exif.GPSInfo.GPSLatitude' in self and 'Exif.GPSInfo.GPSLongitude' in self:
