@@ -21,13 +21,25 @@ from lxml import etree
 from threading import Thread
 
 class GeonamesApi:
-    def __init__(self, username):
-        self.username = username
+    def __init__(self, args):
+        self.username = args.geonames_username
         self.baseurl = 'http://api.geonames.org'
         self.locations = {}
         self.countries = {}
+        self.minPause = 3600.0 / args.throttle if args.throttle is not None else None
+        self.prevRequestTime = None
+
+    def throttle(self):
+        if self.minPause is not None:
+            if self.prevRequestTime is not None:
+                sincePrev = time.time() - self.prevRequestTime
+                if sincePrev < self.minPause:
+                    logging.debug("sleeping %fs", self.minPause - sincePrev)
+                    time.sleep(self.minPause - sincePrev)
+            self.prevRequestTime = time.time()
 
     def request(self, path, args):
+        self.throttle()
         args['username'] = self.username
         url = "%s/%s?%s" % (self.baseurl, path, urllib.urlencode(args))
         httpResult = urllib2.urlopen(url).read()
@@ -390,6 +402,8 @@ op.add_argument("-a", "--augment", dest="augment_file", metavar="FILE", default=
                 help="CSV formatted protocol input")
 op.add_argument("-u", "--geonames-username", dest="geonames_username", metavar="USER", default="demo",
                 help="Username for geonames.org requests")
+op.add_argument("-T", "--thottle", metavar="REQUESTS", type=float, dest="throttle", default=None,
+                help="Number of requests per hour")
 op.add_argument("--max-delta", dest="max_delta", metavar="SECONDS", default="300sec", type=timeDelta,
                 help="Maximum time difference between to track points")
 op.add_argument("--max-distance", dest="max_distance", metavar="METER", default="100", type=int,
@@ -428,7 +442,7 @@ class TagMapper(defaultdict):
 args.tagmapper = TagMapper()
 args.tagmapper.addCountry('Austria', 'adminName3', 'adminName1')
 
-geoapi = GeonamesApi(args.geonames_username)
+geoapi = GeonamesApi(args)
 
 logging.basicConfig(format='%(message)s', level=args.loglevel)
 
