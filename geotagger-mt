@@ -1,4 +1,4 @@
-#!/opt/local/bin/python
+#!/usr/bin/env python
 
 import bisect
 import csv
@@ -7,9 +7,9 @@ import json
 import logging
 import math
 import os
-import pyexiv2
 import pytz
 import re
+import subprocess
 import time
 import urllib, urllib2
 from Queue import Queue
@@ -113,9 +113,7 @@ class Coordinate:
         self.dms = (d, m, s*60, ref[0 if flt >= 0 else -1])
 
     def exifList(self):
-        return [pyexiv2.Rational(self.dms[0], 1),
-                pyexiv2.Rational(self.dms[1], 1),
-                pyexiv2.Rational(self.dms[2]*10000, 10000)]
+        return [(self.dms[0], 1), (self.dms[1], 1), (int(self.dms[2]*10000), 10000)]
 
     def exifRef(self):
         return self.dms[3]
@@ -124,14 +122,39 @@ class Coordinate:
         return u"%d\xb0%d'%f%s" % self.dms
 
 def make_float(x):
-    return x.to_float() if type(x)==type(pyexiv2.Rational(1,1)) else float(x)
+    return float(x[0])/x[1] if type(x)==tuple and len(x)==2 else float(x)
 
 class WorkerThread(Thread):
     class QueueItem:
         def __init__(self, image):
-            self.metadata = pyexiv2.ImageMetadata(image)
-            self.metadata.read()
             self.fn = image
+            self.metadata = {}
+
+            cmd = ["exiv2", "-pe"]
+            for tag in ('Exif.Photo.DateTimeOriginal',
+                           'Exif.GPSInfo.GPSLatitudeRef',
+                           'Exif.GPSInfo.GPSLatitude',
+                           'Exif.GPSInfo.GPSLongitudeRef',
+                           'Exif.GPSInfo.GPSLongitude'):
+                cmd.extend(["-K", tag])
+            cmd.append(image)
+
+            lines = subprocess.check_output(cmd).splitlines()
+            regex = re.compile("^(.+?)\s+(.+?)\s+(.+?)\s+(.*?)\s*$")
+            for line in lines:
+                tag, typ, siz, val = regex.match(line).groups()
+                siz = int(siz)
+                if typ == 'Rational':
+                    val = [tuple([int(i) for i in fract.split("/")]) for fract in val.split(" ")]
+
+                elif typ in ('Short', 'Long'):
+                    val = [int(i) for i in val.split(" ")]
+                elif typ == 'Ascii' and 'DateTime' in tag:
+                    val = datetime.strptime(val, "%Y:%m:%d %H:%M:%S")
+
+                self.metadata[tag] = val
+
+            print self.metadata
             self.modified = False
             self.protocol = { 'File': image, 'Date': str(self.timestamp()) }
             self.pos = None
@@ -147,7 +170,19 @@ class WorkerThread(Thread):
             self.modified = True
 
         def write(self):
-            self.metadata.write()
+            if self.modified:
+                cmd = ["exiv2"]
+
+                for tag, val in self.metadata.iteritems():
+                    if tag != 'Exif.Photo.DateTimeOriginal':
+                        if type(val) == list:
+                            cmd.extend(["-M", "set %s %s" % (tag, " ".join(["%d/%d" % f for f in val]))])
+                        else:
+                            cmd.extend(["-M", "set %s %s" % (tag, val)])
+
+                cmd.append(self.fn)
+                subprocess.check_call(cmd)
+
             self.modified = False
 
         def augment(self, d):
@@ -165,7 +200,7 @@ class WorkerThread(Thread):
                     self.setIptcTag(iptc_tag, d[iptc_tag])
 
         def timestamp(self):
-            return self['Exif.Photo.DateTimeOriginal'].value
+            return self['Exif.Photo.DateTimeOriginal']
 
         def setPos(self, pos):
             self.pos = pos
@@ -183,7 +218,7 @@ class WorkerThread(Thread):
 
             if pos.ele is not None:
                 self.protocol['Elevation'] = pos.ele
-                self['Exif.GPSInfo.GPSAltitude'] = pyexiv2.Rational(abs(pos.ele), 1)
+                self['Exif.GPSInfo.GPSAltitude'] = [(abs(pos.ele), 1)]
                 self['Exif.GPSInfo.GPSAltitudeRef'] = '0' if pos.ele >= 0 else '1';
 
         def setIptcTag(self, tag, value):
@@ -191,19 +226,19 @@ class WorkerThread(Thread):
                 self.protocol[tag] = value.encode('utf-8')
             else:
                 self.protocol[tag] = value
-            self['Iptc.Application2.' + tag] = [value]
+            self['Iptc.Application2.' + tag] = value
             try:
                 value.encode('ascii')
             except UnicodeEncodeError:
-                self.metadata.iptc_charset = 'utf-8'
+                self.metadata['Iptc.Envelope.CharacterSet'] = '\x1b%G'
 
         def resolveLocation(self, args, api):
             if 'Exif.GPSInfo.GPSLatitude' in self and 'Exif.GPSInfo.GPSLongitude' in self:
-                dms = map(lambda x: make_float(x), self['Exif.GPSInfo.GPSLatitude'].value)
-                ref = self['Exif.GPSInfo.GPSLatitudeRef'].value
+                dms = map(lambda x: make_float(x), self['Exif.GPSInfo.GPSLatitude'])
+                ref = self['Exif.GPSInfo.GPSLatitudeRef']
                 lat = float(dms[0]+dms[1]/60+dms[2]/3600) * {'N':1,'S':-1}[ref]
-                dms = map(lambda x: make_float(x), self['Exif.GPSInfo.GPSLongitude'].value)
-                ref = self['Exif.GPSInfo.GPSLongitudeRef'].value
+                dms = map(lambda x: make_float(x), self['Exif.GPSInfo.GPSLongitude'])
+                ref = self['Exif.GPSInfo.GPSLongitudeRef']
                 lon = float(dms[0]+dms[1]/60+dms[2]/3600) * {'E':1,'W':-1}[ref]
                 loc = api.location(lat, lon)
                 country = loc['countryName']
