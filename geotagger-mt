@@ -154,7 +154,6 @@ class WorkerThread(Thread):
 
                 self.metadata[tag] = val
 
-            print self.metadata
             self.modified = False
             self.protocol = { 'File': image, 'Date': str(self.timestamp()) }
             self.pos = None
