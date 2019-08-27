@@ -54,7 +54,7 @@ class GeonamesApi:
         key = (lat, lon)
         if not key in self.locations:
             res = self.request('findNearbyPostalCodesJSON',
-                               { 'lat': lat, 'lng': lon, 'maxRows': 1 })['postalCodes'][0]
+                               { 'radius': 30, 'lat': lat, 'lng': lon, 'maxRows': 1 })['postalCodes'][0]
             self.locations[key] = res
             ccode = res['countryCode']
             if not ccode in self.countries:
